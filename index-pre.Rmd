@@ -1,0 +1,563 @@
+---
+title: "EDLD 650 Capstone: Predicting the TBR List"
+author: "Mallory Pennington"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(rio)
+library(here)
+library(tidyverse)
+library(gghighlight)
+library(scales)
+library(plotly)
+library(RSelenium)
+library(rvest)
+library(xml2)
+
+data = read.csv("storygraph1.csv")
+read <- subset(data, Read.Status == "read")
+tbr <- subset(data, Read.Status == "to-read")
+
+```
+
+#Coding a model to predict the likelihood of reccomending a book I haven't read yet
+
+Hi there! My name is Mallory, and I like to read. I've read more than 500 books in the past 2 years. This project was completed as a capstone for the Educational Data Science Series at the University of Oregon in March of 2024. 
+
+I used a .csv export of my reading data from the website/app TheStorygraph, a Goodreads alternative which I have been using to track my reading and leave reviews since late 2021/early 2022. 
+
+You can find TheStorygraph online here:
+Your own data can be exported under your Account page. 
+
+The data has been imported already during the setup stages and divided into "read" and "to be read" datasets in R. Below is the process I utilized to clean my data, run my model, and predict probability of a recommendation for books in the "to be read" dataset. 
+
+
+##Data cleaning
+
+Below, I am creating my outcome variable (recommendation) as either a Yes (1) or No (0) for each dataset, leaving the column empty for the TBR data. I am also removing books without complete reviews.
+
+```{r}
+read$recc <- ifelse(read$Star.Rating > 3.5, 1, 0)
+tbr$recc <- NA
+
+#only read books with a rating
+read <- read[complete.cases(read[ , 24]),]
+
+read <- read %>% mutate(
+  Pace = as.factor(Pace)
+)
+levels(read$Pace)[1] <- NA
+
+read <- read[complete.cases(read[ , 12]),]
+
+```
+
+
+
+###Web scraping
+
+To obtain review information for books on my TBR list, I scraped data from each book's TheStorygraph page and used the information and answers to review questions that are the most popular amongst users. For both my Read and TBR lists, I scraped each book's description from TheStorygraph as well. 
+
+```{r}
+##now, let's write some for loops!
+tbr$commtags <- NA
+tbr$Description <- NA
+read$Description <- NA
+pattern <- "<script>[\\s\\S]*?\\$\\('.read-more-btn'\\).on\\('click'[\\s\\S]*?<\\/script>"
+
+for (i in 1:length(tbr$Link)) {
+  url = tbr$Link[i]
+  page <- read_html(url)
+  
+  #tags for mood & pace
+  tags_text <- page %>%
+  html_nodes(".book-page-tag-section") %>%
+  html_text()
+  tags <- unlist(strsplit(tags_text[[1]], "\n"))
+  tags <- trimws(tags)
+  tags <- paste(tags, collapse = " ")
+  tbr$commtags[i] <- tags
+  
+  #review polls
+  review_text <- page %>% 
+  html_nodes(".review-response-summary") %>% 
+  html_text()
+  tbr$Character..or.Plot.Driven.[i] <- word(review_text[1], 1)
+  tbr$Strong.Character.Development.[i] <-word(review_text[2], 1)
+  tbr$Loveable.Characters.[i] <-word(review_text[3], 1)
+  tbr$Diverse.Characters.[i] <-word(review_text[4], 1)
+  tbr$Flawed.Characters.[i] <-word(review_text[5], 1)
+  
+  #blurb
+  html_content_str <- paste(page, collapse = "\n")
+  matched_script <- str_extract(html_content_str, pattern)
+  matched_script
+  
+  text_content <- str_match(matched_script, 'html\\(\'(.*)\'\\)')[,2]
+  text_content <- gsub("\\\\", "", text_content, fixed = TRUE)
+  cleaned_text <- gsub("<.*?>", "", text_content)
+  cleaned_text <- substr(cleaned_text, 12, nchar(cleaned_text))
+  tbr$Description[i] <- cleaned_text
+
+}
+
+for (i in 1:length(read$Link)){
+  #blurb
+  url = read$Link[i]
+  page <- read_html(url)
+  
+  html_content_str <- paste(page, collapse = "\n")
+  matched_script <- str_extract(html_content_str, pattern)
+  matched_script
+  text_content <- str_match(matched_script, 'html\\(\'(.*)\'\\)')[,2]
+  text_content <- gsub("\\\\", "", text_content, fixed = TRUE)
+  cleaned_text <- gsub("<.*?>", "", text_content)
+  cleaned_text <- substr(cleaned_text, 12, nchar(cleaned_text))
+  read$Description[i] <- cleaned_text
+}
+```
+
+```{r}
+#so sick of running these (above) loops lol let's export
+#write.csv(read, "reads.csv")
+#write.csv(tbr, "tbrs.csv")
+```
+
+I exported my data and re-imported it, to avoid running the for-loops again unnecessarily, as they can be time- and resource-intensive.
+
+```{r}
+reads <- rio::import(here::here("capstone/reads.csv"))
+tbrs <- rio::import(here::here("capstone/tbrs.csv"))
+```
+
+I used a package imported from Python, texstat, to calculate a Flesch reading ease score for each book's description. For more information on using the reticulate to import Python modules, see: https://rstudio.github.io/reticulate/
+
+```{r}
+#Flesch reading ease scores
+library(reticulate)
+#py_install("textstat")
+textstat <- import("textstat")
+
+reads$FRE <- NA
+tbrs$FRE <- NA
+
+for (i in 1:length(reads$Description)) {
+  reads$FRE[i] <- textstat$flesch_reading_ease(reads$Description[i])
+}
+
+for (i in 1:length(tbrs$Description)) {
+  tbrs$FRE[i] <- textstat$flesch_reading_ease(tbrs$Description[i])
+}
+```
+
+Below, I cleaned the scraped review data for the  TBR list. I created "dummy codes" for each potential "Mood" for both lists, such that if a book has a given mood, it will have a 1 in the column referring to that Mood, and if it doesn't, it'll have a 0 in that column. I ensured that all my variables were of the correct type, e.g. factors with the correct levels, and removed more incomplete reviews from the Read list. 
+
+```{r}
+#oragnize tbr tags
+
+#pace = last word of commtags column, move to Pace column
+for (i in 1:length(tbrs$commtags)) {
+  tbrs$Pace[i] <- word(tbrs$commtags[i], -3)
+}
+
+tbrs <- tbrs %>% mutate(
+  Pace = as.factor(Pace)
+)
+levels(tbrs$Pace) <- c(NA, "fast", "medium", "slow")
+tbrs <- tbrs[complete.cases(tbrs[ , 14]),]
+
+reads <- reads %>% mutate(
+  Pace = as.factor(Pace)
+)
+
+#moods = some amount of words in the middle of commtags... ok let's do this
+
+pattern2 <- c("adventurous", "challenging", "dark", "emotional", "funny", "hopeful", "informative", "inspiring", "lighthearted", "mysterious", "reflective", "relaxing", "sad", "tense")
+
+place1 <- NA
+
+for (i in 1:length(tbrs$commtags)) {
+  place1 <- str_extract(tbrs$commtags[i], pattern2)
+  place1 <- place1[!is.na(place1)]
+  tbrs$Moods[i] <- toString(place1)
+}
+
+#remove commtags column
+
+tbrs <- tbrs[, -26]
+
+#remove unreleased books
+
+tbrs <- tbrs[complete.cases(tbrs[ , 15]),]
+tbrs = subset(tbrs, Title != "A Magical Girl Retires: A Novel")
+
+#rename poll levels
+
+tbrs <- tbrs %>% mutate(
+  Character..or.Plot.Driven. = as.factor(Character..or.Plot.Driven.),
+  Strong.Character.Development. = as.factor(Strong.Character.Development.),
+  Loveable.Characters. = as.factor(Loveable.Characters.),
+  Diverse.Characters. = as.factor(Diverse.Characters.),
+  Flawed.Characters. = as.factor(Flawed.Characters.)
+)
+
+levels(tbrs$Character..or.Plot.Driven.) <- c("A mix", "Character", "Plot")
+levels(tbrs$Strong.Character.Development.) <- c("It's complicated", "No", "Yes")
+levels(tbrs$Loveable.Characters.) <- c("It's complicated", "No", "Yes")
+levels(tbrs$Diverse.Characters.) <- c("It's complicated", "No", "Yes")
+levels(tbrs$Flawed.Characters.) <- c("It's complicated", "No", "Yes")
+
+
+#dummy coding for each mood
+tbrs$adventurous <- NA
+tbrs$challenging <- NA
+tbrs$dark <- NA
+tbrs$emotional <- NA
+tbrs$funny <- NA
+tbrs$hopeful <- NA
+tbrs$informative <- NA
+tbrs$inspiring <- NA
+tbrs$lighthearted <- NA
+tbrs$mysterious <- NA
+tbrs$reflective <- NA
+tbrs$relaxing <- NA
+tbrs$sad <- NA
+tbrs$tense <- NA
+
+for (i in 1:length(tbrs$Moods)) {
+tbrs$adventurous[i] <- ifelse(grepl("adventurous", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$challenging[i] <- ifelse(grepl("challenging", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$dark[i] <- ifelse(grepl("dark", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$emotional[i] <- ifelse(grepl("emotional", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$funny[i] <- ifelse(grepl("funny", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$hopeful[i] <- ifelse(grepl("hopeful", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$informative[i] <- ifelse(grepl("informative", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$inspiring[i] <- ifelse(grepl("inspiring", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$lighthearted[i] <- ifelse(grepl("lighthearted", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$mysterious[i] <- ifelse(grepl("mysterious", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$reflective[i] <- ifelse(grepl("reflective", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$relaxing[i] <- ifelse(grepl("relaxing", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$sad[i] <- ifelse(grepl("sad", tbrs$Moods[i]) == TRUE, 1, 0)
+tbrs$tense[i] <- ifelse(grepl("tense", tbrs$Moods[i]) == TRUE, 1, 0)
+}
+
+
+
+
+reads$adventurous <- NA
+reads$challenging <- NA
+reads$dark <- NA
+reads$emotional <- NA
+reads$funny <- NA
+reads$hopeful <- NA
+reads$informative <- NA
+reads$inspiring <- NA
+reads$lighthearted <- NA
+reads$mysterious <- NA
+reads$reflective <- NA
+reads$relaxing <- NA
+reads$sad <- NA
+reads$tense <- NA
+
+for (i in 1:length(reads$Moods)) {
+reads$adventurous[i] <- ifelse(grepl("adventurous", reads$Moods[i]) == TRUE, 1, 0)
+reads$challenging[i] <- ifelse(grepl("challenging", reads$Moods[i]) == TRUE, 1, 0)
+reads$dark[i] <- ifelse(grepl("dark", reads$Moods[i]) == TRUE, 1, 0)
+reads$emotional[i] <- ifelse(grepl("emotional", reads$Moods[i]) == TRUE, 1, 0)
+reads$funny[i] <- ifelse(grepl("funny", reads$Moods[i]) == TRUE, 1, 0)
+reads$hopeful[i] <- ifelse(grepl("hopeful", reads$Moods[i]) == TRUE, 1, 0)
+reads$informative[i] <- ifelse(grepl("informative", reads$Moods[i]) == TRUE, 1, 0)
+reads$inspiring[i] <- ifelse(grepl("inspiring", reads$Moods[i]) == TRUE, 1, 0)
+reads$lighthearted[i] <- ifelse(grepl("lighthearted", reads$Moods[i]) == TRUE, 1, 0)
+reads$mysterious[i] <- ifelse(grepl("mysterious", reads$Moods[i]) == TRUE, 1, 0)
+reads$reflective[i] <- ifelse(grepl("reflective", reads$Moods[i]) == TRUE, 1, 0)
+reads$relaxing[i] <- ifelse(grepl("relaxing", reads$Moods[i]) == TRUE, 1, 0)
+reads$sad[i] <- ifelse(grepl("sad", reads$Moods[i]) == TRUE, 1, 0)
+reads$tense[i] <- ifelse(grepl("tense", reads$Moods[i]) == TRUE, 1, 0)
+}
+
+# now clean up reads a bit
+
+reads <- reads %>% mutate(
+  Moods = as.factor(Moods)
+)
+
+levels(reads$Moods)[1] <- NA
+
+reads <- reads[complete.cases(reads[, 13]),]
+
+reads <- reads %>% mutate(
+  Character..or.Plot.Driven. = as.factor(Character..or.Plot.Driven.),
+  Strong.Character.Development. = as.factor(Strong.Character.Development.),
+  Loveable.Characters. = as.factor(Loveable.Characters.),
+  Diverse.Characters. = as.factor(Diverse.Characters.),
+  Flawed.Characters. = as.factor(Flawed.Characters.)
+)
+
+levels(reads$Character..or.Plot.Driven.)[1] <- NA
+levels(reads$Strong.Character.Development.)[1] <- NA
+levels(reads$Loveable.Characters.)[1] <- NA
+levels(reads$Diverse.Characters.)[1] <- NA
+levels(reads$Flawed.Characters.)[1] <- NA
+levels(reads$Pace)[1] <- NA
+
+
+reads$recc <- ifelse(reads$Star.Rating > 3.5, 1, 0)
+tbrs$recc <- NA
+
+reads <- reads %>% mutate(
+  recc = as.factor(recc)
+)
+levels(reads$recc) <- c("No", "Yes")
+tbrs <- tbrs %>% mutate(
+  recc = as.factor(recc)
+)
+levels(tbrs$recc) <- c("No", "Yes")
+
+reads <- subset(reads,!is.na(Pace))
+reads <- subset(reads,!is.na(Character..or.Plot.Driven.))
+```
+
+
+##Building a classification model 
+
+Now that I have two clean datasets, I am using the recipes and caret packages to build a classification model with the reccomendation column as its outcome and review factors, moods, and the FRE score for each book as predictors. 
+
+```{r}
+library(recipes)
+
+blueprint <- recipe(x  = reads,
+                    vars  = c('recc', 'Pace', 'Character..or.Plot.Driven.', 'Strong.Character.Development.', 'Loveable.Characters.', 'Diverse.Characters.', 'Flawed.Characters.', 'FRE', 'adventurous', 'challenging', 'dark', 'emotional', 'funny', 'hopeful', 'informative', 'inspiring', 'lighthearted', 'mysterious', 'reflective', 'relaxing', 'sad', 'tense'),
+                    roles = c('outcome', rep('predictor', 21))) %>% 
+   step_dummy(Pace, one_hot=TRUE) %>% 
+   step_dummy(Character..or.Plot.Driven.,one_hot=TRUE) %>% 
+ step_dummy(Strong.Character.Development., one_hot=TRUE) %>% 
+   step_dummy(Loveable.Characters., one_hot=TRUE) %>% 
+   step_dummy(Diverse.Characters., one_hot=TRUE) %>% 
+   step_dummy(Flawed.Characters., one_hot=TRUE)
+
+```
+
+Here I divide my Read list into a training dataset and a test dataset. 
+```{r}
+set.seed(02142024)  # for reproducibility
+  
+loc      <- sample(1:nrow(reads), round(nrow(reads) * 0.9))
+read_tr  <- reads[loc, ]
+read_te  <- reads[-loc, ]
+
+dim(read_tr)
+
+dim(read_te)
+```
+
+Here, I am shuffling the training dataset, and creating the folds I will use for the 10-fold cross validation process for model training. 
+
+```{r}
+library(caret)
+
+read_tr = read_tr[sample(nrow(read_tr)),]
+
+folds = cut(seq(1,nrow(read_tr)),breaks=10,labels=FALSE)
+  
+# Create the list for each fold 
+      
+  my.indices <- vector('list',10)
+
+  for(i in 1:10){
+    my.indices[[i]] <- which(folds!=i)
+  }
+
+  cv <- trainControl(method          = "cv",
+                   index           = my.indices,
+                   classProbs      = TRUE,
+                   summaryFunction = mnLogLoss)
+
+```
+
+
+###No penalty/regularization
+
+This model of logistic regression uses no regularization or penalty. 
+```{r}
+mod <- caret::train(blueprint, 
+                          data      = read_tr, 
+                          method    = "glm",
+                          family    = 'binomial',
+                          metric    = 'logLoss',
+                          trControl = cv)
+mod
+
+ll <- 0.6290002
+```
+
+###Ridge penalty
+
+This model of logistic regression uses ridge penalty. 
+```{r}
+grid <- data.frame(alpha = 0, lambda = c(seq(0,.001,.00001),.005,.01,.05,.1)) 
+```
+
+```{r}
+ridge <- caret::train(blueprint, 
+                                     data      = read_tr, 
+                                     method    = "glmnet",
+                                     family    = 'binomial',
+                                     metric    = 'logLoss',
+                                     trControl = cv,
+                                     tuneGrid  = grid)
+
+#plot(ridge)
+
+llr <- 0.4724348
+
+```
+
+###Lasso penalty
+
+This model of logistic regression uses lasso penalty. 
+
+```{r}
+grid <- data.frame(alpha = 1, lambda = seq(0,.001,.00001)) 
+```
+
+```{r}
+lasso <- caret::train(blueprint, 
+                                     data      = read_tr, 
+                                     method    = "glmnet",
+                                     family    = 'binomial',
+                                     metric    = 'logLoss',
+                                     trControl = cv,
+                                     tuneGrid  = grid)
+
+#plot(lasso)
+
+lll <- 0.5429366
+
+```
+
+##Final model decision (based on performance)
+
+```{r}
+library(cutpointr)
+#non-regularized
+
+predicted_te1 <- predict(mod, read_te, type='prob')
+
+cut.obj <- cutpointr(x     = predicted_te1$Yes,
+                     class = read_te$recc)
+
+auc1 <- auc(cut.obj)
+
+pred_class <- ifelse(predicted_te1$Yes>0.54,'Yes','No')
+
+confusion1 <- table(read_te$rec, pred_class)
+
+tn1 <- confusion1[1,1]/(confusion1[1,1]+confusion1[1,2])
+tp1 <- confusion1[2,2]/(confusion1[2,1]+confusion1[2,2])
+prec1 <- confusion1[2,2]/(confusion1[1,2]+confusion1[2,2])
+acc1 <- (confusion1[1,1]+confusion1[2,2])/(confusion1[1,1]+confusion1[1,2]+confusion1[2,1]+confusion1[2,2])
+
+#ridge penatly
+predicted_te2 <- predict(ridge, read_te, type='prob')
+
+cut.obj <- cutpointr(x     = predicted_te2$Yes,
+                     class = read_te$recc)
+
+auc2 <- auc(cut.obj)
+
+pred_class <- ifelse(predicted_te2$Yes>0.5,'Yes','No')
+
+confusion2 <- table(read_te$recc, pred_class)
+
+tn2 <- confusion2[1,1]/(confusion2[1,1]+confusion2[1,2])
+tp2 <- confusion2[2,2]/(confusion2[2,1]+confusion2[2,2])
+prec2 <- confusion2[2,2]/(confusion2[1,2]+confusion2[2,2])
+acc2 <- (confusion2[1,1]+confusion2[2,2])/(confusion2[1,1]+confusion2[1,2]+confusion2[2,1]+confusion2[2,2])
+
+#lasso penalty
+predicted_te3 <- predict(lasso, read_te, type='prob')
+
+cut.obj <- cutpointr(x     = predicted_te3$Yes,
+                     class = read_te$recc)
+
+auc3 <- auc(cut.obj)
+
+pred_class <- ifelse(predicted_te3$Yes>0.5,'Yes','No')
+
+confusion3 <- table(read_te$rec, pred_class)
+
+tn3 <- confusion3[1,1]/(confusion3[1,1]+confusion3[1,2])
+tp3 <- confusion3[2,2]/(confusion3[2,1]+confusion3[2,2])
+prec3 <- confusion3[2,2]/(confusion3[1,2]+confusion3[2,2])
+acc3 <- (confusion3[1,1]+confusion3[2,2])/(confusion3[1,1]+confusion3[1,2]+confusion3[2,1]+confusion3[2,2])
+```
+
+```{r}
+logist = data.frame(Model = "Logistic Regression", 
+                   LL = ll,
+                   AUC = auc1,
+                   ACC = acc1,
+                   TPR = tp1,
+                    TNR = tn1,
+                    PRE = prec1
+                   )
+
+log_ridge = data.frame(Model = "Logistic Regression with Ridge Penalty",
+                      LL = llr,
+                      AUC = auc2,
+                      ACC = acc2,
+                      TPR = tp2,
+                      TNR = tn2,
+                      PRE = prec2)
+
+log_lasso = data.frame(Model = "Logistic Regression with Lasso Penalty",
+                      LL = lll,
+                      AUC = auc3,
+                      ACC = acc3,
+                      TPR = tp3,
+                      TNR = tn3,
+                      PRE = prec3)
+
+tabtime = rbind(logist, log_ridge, log_lasso)
+tabtime
+```
+
+With the lowest logLoss and the highest AUC, the model of logistic regression with ridge penalty is the final model to be used going forward. The logLoss of this model is 0.47. Some flaws in the model training and testing are expected at this time due to the small size of the training and test datasets.
+
+```{r}
+coefs <- coef(ridge$finalModel,ridge$bestTune$lambda)
+ind   <- order(abs(coefs),decreasing=T)
+coef_tab <- head(as.matrix(coefs[ind[-1],]),10)
+coef_tab
+```
+It is clear that loveable characters--or, in particular, the absence of non-loveable characters--is the most important predictor of whether a book will be recommended or not. Relaxing, informative, and inspiring books are also important. 
+
+Now, let's run our model (with ridge penalty) on the TBR list.
+
+```{r}
+tbr_prediction <- predict(ridge, tbrs, type='prob')
+tbrs$recc <- ifelse(tbr_prediction$Yes>0.5,'Yes','No')
+tbrs$recc_yes_prob <- tbr_prediction$Yes
+
+tbrs <- tbrs[order(tbrs$recc_yes_prob, decreasing = T),]
+
+#also getting the complete read dataset
+readdata <- rbind(read_tr, read_te)
+```
+
+Now, I will export this data and the tables on model performance so that I may import and utilize it in my Shinyapp web-page set up. 
+
+```{r}
+write.csv(tbrs, "final.csv")
+write.csv(tabtime, "tabtime.csv")
+write.csv(coef_tab, "coef_tab.csv")
+write.csv(confusion2, "confusion_ridge.csv")
+write.csv(readdata, "readdata.csv")
+```
+
+
+
